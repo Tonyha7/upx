@@ -42,6 +42,7 @@ void PackHeader::reset() noexcept {
     mem_clear(this);
     version = -1;
     format = -1;
+    crypto_enabled = false;
     compress_result.reset();
 }
 
@@ -200,6 +201,7 @@ bool PackHeader::decodePackHeaderFromBuf(SPAN_S(const byte) buf, int blen) {
     format = p[5];
     method = p[6];
     level = p[7];
+    crypto_enabled = (level & 0x80) != 0; // save crypto flag before masking
     filter_cto = 0;
 
     if (opt->debug.debug_level) {

@@ -31,6 +31,7 @@
 #include "packer.h"
 #include "pefile.h"
 #include "linker.h"
+#include "crypto.h"
 
 #define FILLVAL 0
 #define import  my_import // "import" is a keyword since C++20
@@ -2205,8 +2206,22 @@ void PeFile::checkHeaderValues(unsigned subsystem, unsigned mask, unsigned ih_en
     if (isection == nullptr)
         throwCantPack("No section was found");
 
-    if (memcmp(isection[0].name, "UPX", 3) == 0)
-        throwAlreadyPackedByUPX();
+    // Already-packed detection: search for UPX! magic in section raw data
+    // (section names are obfuscated, so check magic instead)
+    {
+        upx_off_t saved_pos = fi->tell();
+        const unsigned scan_size = 4096;
+        MemBuffer scan(scan_size);
+        unsigned rawptr = isection[1].rawdataptr;
+        if (rawptr > 0 && rawptr < (unsigned) fi->st_size()) {
+            fi->seek(rawptr, SEEK_SET);
+            int n = fi->read(scan, UPX_MIN((upx_off_t) scan_size,
+                                            fi->st_size() - (upx_off_t) rawptr));
+            fi->seek(saved_pos, SEEK_SET);
+            if (n >= 4 && find_le32(raw_bytes(scan, n), n, UPX_MAGIC_LE32) >= 0)
+                throwAlreadyPackedByUPX();
+        }
+    }
 
     if (!opt->force && IDSIZE(15))
         throwCantPack("file is possibly packed/protected (try --force)");
@@ -2631,17 +2646,28 @@ void PeFile::pack0(OutputFile *fo, ht &ih, ht &oh, unsigned subsystem_mask,
     // the virtual size of this section
     const unsigned ncsize_virt_increase = soxrelocs && (ncsize & oam1) == 0 ? 8 : 0;
 
-    // fill the sections
-    strcpy(osection[0].name, "UPX0");
-    strcpy(osection[1].name, "UPX1");
-    // after some windoze debugging I found that the name of the sections
-    // DOES matter :( .rsrc is used by oleaut32.dll (TYPELIBS)
-    // and because of this lame dll, the resource stuff must be the
-    // first in the 3rd section - the author of this dll seems to be
-    // too idiot to use the data directories... M$ suxx 4 ever!
-    // ... even worse: exploder.exe in NiceTry also depends on this to
-    // locate version info
-    strcpy(osection[2].name, !last_section_rsrc_only && soresources ? ".rsrc" : "UPX2");
+    // fill sections with fully random non-printable names
+    // .rsrc name is kept for Windows oleaut32.dll compatibility
+    byte obf_name[8];
+    unsigned name_seed = upx_rand() ^ (oh.codebase << 8);
+
+    // Section 0: all 8 bytes random non-printable
+    upx_crypto_random_nonprintable(obf_name, 8, name_seed);
+    memcpy(osection[0].name, obf_name, 8);
+
+    // Section 1: all 8 bytes random non-printable (different seed)
+    name_seed ^= 0x5A5A5A5A;
+    upx_crypto_random_nonprintable(obf_name, 8, name_seed);
+    memcpy(osection[1].name, obf_name, 8);
+
+    // Section 2: .rsrc if resources exist, otherwise random non-printable
+    if (!last_section_rsrc_only && soresources) {
+        strcpy(osection[2].name, ".rsrc"); // Windows requires .rsrc name
+    } else {
+        name_seed ^= 0xA5A5A5A5;
+        upx_crypto_random_nonprintable(obf_name, 8, name_seed);
+        memcpy(osection[2].name, obf_name, 8);
+    }
 
     osection[0].vaddr = rvamin;
     osection[1].vaddr = s1addr;
@@ -3156,19 +3182,22 @@ int PeFile::canUnpack0(unsigned max_sections, unsigned objs, unsigned ih_entry, 
     fi->readx(isection, sizeof(pe_section_t) * objs);
     bool is_packed = (objs <= max_sections && (IDSIZE(15) || ih_entry > isection[1].vaddr));
     bool found_ph = false;
-    if (memcmp(isection[0].name, "UPX", 3) == 0) {
-        // current version
-        fi->seek(isection[1].rawdataptr - 64, SEEK_SET);
-        found_ph = readPackHeader(1024);
-        if (!found_ph) {
-            // old versions
-            fi->seek(isection[2].rawdataptr, SEEK_SET);
+    // Search for PackHeader using same base offset as unpack expects
+    // (isection[1].rawdataptr - 64). This ensures ph.buf_offset is correct.
+    if (objs >= 2) {
+        unsigned raw = isection[1].rawdataptr;
+        if (raw >= 64 && raw < (unsigned) fi->st_size()) {
+            fi->seek(raw - 64, SEEK_SET);
+            found_ph = readPackHeader(1024);
+        }
+        if (!found_ph && raw < (unsigned) fi->st_size()) {
+            fi->seek(raw, SEEK_SET);
             found_ph = readPackHeader(1024);
         }
     }
-    if (is_packed && found_ph)
-        return true;
-    if (!is_packed && !found_ph)
+    if (found_ph)
+        return true; // PackHeader found = definitely packed
+    if (!is_packed)
         return -1;
     if (is_packed && ih_entry < isection[2].vaddr) {
         byte buf[256];

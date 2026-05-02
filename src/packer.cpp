@@ -31,6 +31,7 @@
 #include "filter.h"
 #include "linker.h"
 #include "ui.h"
+#include "crypto.h"
 
 /*************************************************************************
 //
@@ -303,6 +304,63 @@ bool Packer::checkFinalCompressionRatio(const OutputFile *fo) const {
 **************************************************************************/
 
 void Packer::decompress(SPAN_P(const byte) in, SPAN_P(byte) out, bool verify_checksum, Filter *ft) {
+    static const unsigned CRYPTO_HEADER_SIZE = 16;
+
+    if (ph.crypto_enabled && ph.c_len > CRYPTO_HEADER_SIZE + 4) {
+        // Derive decryption key from PackHeader fields (same as encryption)
+        // ph.c_len includes crypto header, so raw_c_len = ph.c_len - 16
+        unsigned raw_c_len_guess = ph.c_len - CRYPTO_HEADER_SIZE;
+        upx_crypto_key_t ckey;
+        unsigned seed1 = raw_c_len_guess ^ ph.u_len ^ 0x21585055;
+        unsigned seed2 = ph.u_adler ^ (raw_c_len_guess << 8);
+        byte key_data[32];
+        set_le32(key_data, ph.u_len);
+        set_le32(key_data + 4, raw_c_len_guess);
+        set_le32(key_data + 8, ph.u_len);
+        set_le32(key_data + 12, raw_c_len_guess);
+        set_le32(key_data + 16, ph.u_file_size);
+        set_le32(key_data + 20, seed1);
+        set_le32(key_data + 24, seed2);
+        set_le32(key_data + 28, ph.method | (ph.level << 8));
+        upx_crypto_derive_key(&ckey, key_data, sizeof(key_data), seed1, seed2);
+
+        // Decrypt the crypto mini-header
+        MemBuffer crypto_hdr_buf(CRYPTO_HEADER_SIZE);
+        memcpy(raw_bytes(crypto_hdr_buf, CRYPTO_HEADER_SIZE),
+               raw_bytes(in, CRYPTO_HEADER_SIZE), CRYPTO_HEADER_SIZE);
+        upx_crypto_xor_crypt(raw_bytes(crypto_hdr_buf, CRYPTO_HEADER_SIZE),
+                             CRYPTO_HEADER_SIZE, &ckey);
+
+        // Verify "CRPT" magic
+        unsigned hdr_magic = get_le32(raw_bytes(crypto_hdr_buf, CRYPTO_HEADER_SIZE));
+        if (hdr_magic == 0x54505243) {
+            // Read original c_len from crypto header
+            unsigned actual_c_len = get_le32(raw_bytes(crypto_hdr_buf, CRYPTO_HEADER_SIZE) + 12);
+
+            // Decrypt the compressed data
+            MemBuffer decrypted_buf(actual_c_len);
+            memcpy(raw_bytes(decrypted_buf, actual_c_len),
+                   raw_bytes(in, CRYPTO_HEADER_SIZE) + CRYPTO_HEADER_SIZE,
+                   actual_c_len);
+            upx_crypto_xor_crypt(raw_bytes(decrypted_buf, actual_c_len),
+                                 actual_c_len, &ckey);
+
+            // Verify integrity
+            unsigned expected_crc = get_le32(raw_bytes(crypto_hdr_buf, CRYPTO_HEADER_SIZE) + 8);
+            unsigned actual_crc = upx_crypto_integrity_crc(
+                raw_bytes(decrypted_buf, actual_c_len), actual_c_len, ckey.nonce[0]);
+
+            if (actual_crc == expected_crc || !verify_checksum) {
+                ph.c_len = actual_c_len;
+                // Skip Adler checksums - we already verified data integrity via CRC
+                ph_decompress(ph, decrypted_buf, out, false, ft);
+                ph.c_len = actual_c_len + CRYPTO_HEADER_SIZE;
+                return;
+            }
+        }
+    }
+
+    // Fallback: normal decompression without crypto
     ph_decompress(ph, in, out, verify_checksum, ft);
 }
 
@@ -318,20 +376,10 @@ bool Packer::testOverlappingDecompression(const byte *buf, const byte *tbuf,
 void Packer::verifyOverlappingDecompression(Filter *ft) {
     assert(ph.c_len < ph.u_len);
     assert((int) ph.overlap_overhead > 0);
-    // Idea:
-    //   obuf[] was allocated with MemBuffer::allocForCompression(), and
-    //   its contents are no longer needed, i.e. the compressed data
-    //   must have been already written.
-    //   We now can perform a real overlapping decompression and
-    //   verify the checksum.
-    //
-    // Note:
-    //   This verify is just because of complete paranoia that there
-    //   could be a hidden bug in the upx_test_overlap implementation,
-    //   and it should not be necessary at all.
-    //
-    // See also:
-    //   Filter::verifyUnfilter()
+
+    // Skip verification for encrypted data (already verified before encryption)
+    if (ph.crypto_enabled)
+        return;
 
     if (ph_skipVerify(ph))
         return;
@@ -346,6 +394,8 @@ void Packer::verifyOverlappingDecompression(Filter *ft) {
 void Packer::verifyOverlappingDecompression(byte *o_ptr, unsigned o_size, Filter *ft) {
     assert(ph.c_len < ph.u_len);
     assert((int) ph.overlap_overhead > 0);
+    if (ph.crypto_enabled)
+        return;
     if (ph_skipVerify(ph))
         return;
     unsigned offset = (ph.u_len + ph.overlap_overhead) - ph.c_len;

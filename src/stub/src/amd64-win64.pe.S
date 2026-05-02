@@ -90,6 +90,83 @@ section         PEMAIN01
                 lea     rsi, [rip + start_of_compressed]
                 lea     rdi, [rsi + start_of_uncompressed]
 
+// =============
+// ============= ANTI-DEBUG CHECK
+// =============
+section         ANTIDBG64
+                //; Check PEB.BeingDebugged via GS:[0x60]
+                mov     rax, gs:[0x60]
+                movzx   eax, byte ptr [rax + 2]
+                test    eax, eax
+                jz      1f
+                ud2                         //; crash if debugger detected
+1:
+                //; Check NtGlobalFlag
+                mov     rax, gs:[0x60]
+                test    byte ptr [rax + 0xBC], 0x70
+                jz      2f
+                ud2                         //; crash if debugger flags set
+2:
+
+// =============
+// ============= DECRYPT CRYPTO HEADER
+// =============
+section         CRYPTODEC64
+                //; Save registers used by decompressor
+                push    rsi
+                push    rcx
+                push    rax
+                push    rdx
+
+                //; Read and decrypt 16-byte crypto mini-header
+                //; Crypto header: [magic:4][seed:4][crc:4][raw_len:4] XOR'd
+                //; Simple decrypt: XOR each byte with position-dependent key
+                xor     ecx, ecx
+decrypt_hdr64:
+                mov     al, byte ptr [rsi + rcx]
+                mov     dl, cl
+                rol     dl, 3
+                xor     dl, 0x5A
+                xor     al, dl
+                mov     byte ptr [rsi + rcx], al
+                inc     ecx
+                cmp     ecx, 16
+                jb      decrypt_hdr64
+
+                //; Verify "CRPT" magic (0x54505243)
+                cmp     dword ptr [rsi], 0x54505243
+                jne     skip_decrypt64
+
+                //; Get raw compressed length from crypto header
+                mov     ecx, dword ptr [rsi + 12]
+
+                //; XOR-decrypt the actual compressed data (after 16-byte header)
+                push    rdi
+                lea     rdi, [rsi + 16]
+                xor     edx, edx
+decrypt_data64:
+                mov     al, byte ptr [rdi]
+                mov     r8b, dl
+                add     r8b, 16
+                rol     r8b, 3
+                xor     r8b, 0x5A
+                xor     al, r8b
+                mov     byte ptr [rdi], al
+                inc     rdi
+                inc     edx
+                cmp     edx, ecx
+                jb      decrypt_data64
+
+                //; Advance rsi past crypto header
+                add     rsi, 16
+
+skip_decrypt64:
+                pop     rdi
+                pop     rdx
+                pop     rax
+                pop     rcx
+                pop     rsi
+
 section         PEICONS1
                 incw    [rdi + icon_offset]
 section         PEICONS2

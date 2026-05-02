@@ -325,7 +325,7 @@ endif()
 if(NOT UPX_CONFIG_DISABLE_ZSTD)
 endif() # UPX_CONFIG_DISABLE_ZSTD
 
-upx_add_glob_files(upx_SOURCES "src/*.cpp" "src/[cfu]*/*.cpp")
+upx_add_glob_files(upx_SOURCES "src/*.cpp" "src/[cfu]*/*.cpp" "src/crypto.cpp")
 add_executable(upx ${upx_SOURCES})
 if(NOT UPX_CONFIG_DISABLE_CXX_STANDARD)
     set_property(TARGET upx PROPERTY CXX_STANDARD 17)

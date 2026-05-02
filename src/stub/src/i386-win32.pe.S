@@ -48,6 +48,80 @@ get_eip:
                 lea     esi, [eax + start_of_compressed - get_eip]
 section         PESOUNC0
                 lea     edi, [esi + start_of_uncompressed]
+
+// =============
+// ============= ANTI-DEBUG CHECK
+// =============
+section         ANTIDBG32
+                //; Check PEB.BeingDebugged via FS:[0x30]
+                mov     eax, dword ptr fs:[0x30]
+                movzx   eax, byte ptr [eax + 2]
+                test    eax, eax
+                jz      1f
+                ud2                         //; crash if debugger detected
+1:
+                //; Check NtGlobalFlag
+                mov     eax, dword ptr fs:[0x30]
+                test    byte ptr [eax + 0x68], 0x70
+                jz      2f
+                ud2                         //; crash if debugger flags set
+2:
+
+// =============
+// ============= DECRYPT CRYPTO HEADER
+// =============
+section         CRYPTODEC32
+                //; Decrypt 16-byte crypto mini-header
+                push    ecx
+                push    eax
+                push    edx
+                push    ebx
+
+                xor     ecx, ecx
+decrypt_hdr32:
+                mov     al, byte ptr [esi + ecx]
+                mov     dl, cl
+                rol     dl, 3
+                xor     dl, 0x5A
+                xor     al, dl
+                mov     byte ptr [esi + ecx], al
+                inc     ecx
+                cmp     ecx, 16
+                jb      decrypt_hdr32
+
+                //; Verify "CRPT" magic
+                cmp     dword ptr [esi], 0x54505243
+                jne     skip_decrypt32
+
+                //; Get raw compressed length from crypto header
+                mov     ecx, dword ptr [esi + 12]
+
+                //; XOR-decrypt compressed data after header
+                push    edi
+                lea     edi, [esi + 16]
+                xor     edx, edx
+decrypt_data32:
+                mov     al, byte ptr [edi]
+                mov     bl, dl
+                add     bl, 16
+                rol     bl, 3
+                xor     bl, 0x5A
+                xor     al, bl
+                mov     byte ptr [edi], al
+                inc     edi
+                inc     edx
+                cmp     edx, ecx
+                jb      decrypt_data32
+                pop     edi
+
+                //; Advance esi past crypto header
+                add     esi, 16
+
+skip_decrypt32:
+                pop     ebx
+                pop     edx
+                pop     eax
+                pop     ecx
 section         PEICONS1
                 incw    [edi + icon_offset]
 section         PEICONS2

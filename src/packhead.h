@@ -86,6 +86,9 @@ struct PackHeader final {
     // info fields set by Packer::compressWithFilters()
     unsigned overlap_overhead;
 
+    // Security: crypto flag preserved from raw header level field
+    bool crypto_enabled;
+
 private: // UPX conventions
     UPX_CXX_DISABLE_ADDRESS(PackHeader)
     UPX_CXX_DISABLE_NEW_DELETE(PackHeader)
